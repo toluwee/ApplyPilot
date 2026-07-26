@@ -114,9 +114,12 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # projects is allowed to be an empty list (some jobs have no relevant projects)
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    if "projects" not in data:
+        errors.append("Missing required field: projects")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
@@ -140,6 +143,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
         for company in preserved_companies:
             has_company = any(
                 company.lower() in str(e.get("header", "")).lower()
+                or company.lower() in str(e.get("subtitle", "")).lower()
                 for e in data["experience"]
             )
             if not has_company:

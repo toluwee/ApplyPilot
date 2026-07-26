@@ -17,12 +17,14 @@ blocked:
     - "accenture"
     - "AccentureCareers"
     - "Workopolis"
+    - "Thomson Reuters"
   url_patterns:
     - "%glassdoor%"
     - "%google.com/about/careers%"
     - "%google.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+    - "%thomsonreuters%"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:

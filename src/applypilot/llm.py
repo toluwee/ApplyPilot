@@ -170,9 +170,9 @@ class LLMClient:
             headers=headers,
         )
 
-        # 403 on Gemini compat = model not available on compat layer.
+        # 403 or 400 on Gemini compat = model/feature not available on compat layer.
         # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
+        if resp.status_code in (400, 403) and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
         return self._handle_compat_response(resp)
@@ -208,12 +208,14 @@ class LLMClient:
                 return self._chat_compat(messages, temperature, max_tokens)
 
             except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
+                # 400/403 on Gemini compat = model/feature not available on compat layer.
+                # Switch to native generateContent API and stay there.
                 log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
+                    "Gemini compat endpoint returned %s for model '%s'. "
+                    "Switching to native generateContent API. Body: %s",
+                    exc.response.status_code,
                     self.model,
+                    exc.response.text[:300],
                 )
                 self._use_native_gemini = True
                 # Retry immediately with native — don't count as a rate-limit wait

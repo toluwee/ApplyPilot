@@ -143,6 +143,20 @@ def run(
 
 
 @app.command()
+def review(
+    list_: bool = typer.Option(False, "--list", help="List jobs pending review."),
+    approve: Optional[str] = typer.Option(None, "--approve", help="Approve a specific job by URL."),
+    reject: Optional[str] = typer.Option(None, "--reject", help="Reject a specific job by URL."),
+    note: str = typer.Option("", "--note", help="Note to attach to the approval/rejection decision."),
+) -> None:
+    """Review tailored jobs and approve or reject them before auto-applying."""
+    _bootstrap()
+
+    from applypilot.review import run_review
+    run_review(list_=list_, approve=approve, reject=reject, note=note)
+
+
+@app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
@@ -151,6 +165,7 @@ def apply(
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
+    approved_only: bool = typer.Option(False, "--approved-only", help="Only apply to jobs approved via 'applypilot review'."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
@@ -240,6 +255,8 @@ def apply(
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    if approved_only:
+        console.print(f"  Gate:     approved jobs only")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -253,6 +270,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        approved_only=approved_only,
     )
 
 
@@ -281,6 +299,9 @@ def status() -> None:
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
     summary.add_row("Cover letters", str(stats["with_cover_letter"]))
+    summary.add_row("Pending review", str(stats["pending_review"]))
+    summary.add_row("Approved", str(stats["approved"]))
+    summary.add_row("Rejected", str(stats["rejected"]))
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
@@ -323,13 +344,19 @@ def status() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def dashboard(
+    port: int = typer.Option(7410, "--port", help="Port for the local dashboard server."),
+    no_server: bool = typer.Option(False, "--no-server", help="Generate a static HTML snapshot only (no server, approve/reject disabled)."),
+) -> None:
+    """Start the interactive review dashboard in your browser."""
     _bootstrap()
 
-    from applypilot.view import open_dashboard
-
-    open_dashboard()
+    if no_server:
+        from applypilot.view import open_dashboard
+        open_dashboard()
+    else:
+        from applypilot.view import serve_dashboard
+        serve_dashboard(port=port)
 
 
 @app.command()

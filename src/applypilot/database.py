@@ -180,6 +180,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Human approval gate
+    "approval_status": "TEXT",          # NULL | 'approved' | 'rejected'
+    "approval_reviewed_at": "TEXT",
+    "approval_reviewer_notes": "TEXT",
 }
 
 
@@ -287,6 +291,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE fit_score >= 7 AND full_description IS NOT NULL "
+        "AND approval_status = 'approved' "
         "AND tailored_resume_path IS NULL"
     ).fetchone()[0]
 
@@ -321,6 +326,23 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "WHERE tailored_resume_path IS NOT NULL "
         "AND applied_at IS NULL "
         "AND application_url IS NOT NULL"
+    ).fetchone()[0]
+
+    # Approval gate
+    stats["pending_review"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE fit_score >= 7 "
+        "AND full_description IS NOT NULL "
+        "AND approval_status IS NULL "
+        "AND applied_at IS NULL"
+    ).fetchone()[0]
+
+    stats["approved"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE approval_status = 'approved'"
+    ).fetchone()[0]
+
+    stats["rejected"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE approval_status = 'rejected'"
     ).fetchone()[0]
 
     return stats
@@ -388,6 +410,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
+            "AND approval_status = 'approved' "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
@@ -422,3 +445,70 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+def get_pending_review(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return scored jobs awaiting human review (before tailoring).
+
+    Jobs are ordered by fit_score descending so the best matches are reviewed first.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT url, title, site, location, fit_score, score_reasoning,
+               full_description, application_url
+        FROM jobs
+        WHERE fit_score >= 7
+          AND full_description IS NOT NULL
+          AND approval_status IS NULL
+          AND applied_at IS NULL
+        ORDER BY fit_score DESC, discovered_at DESC
+    """).fetchall()
+
+    if rows:
+        columns = rows[0].keys()
+        return [dict(zip(columns, row)) for row in rows]
+    return []
+
+
+def set_approval(url: str, status: str, notes: str = "",
+                 conn: sqlite3.Connection | None = None) -> None:
+    """Set the approval decision for a job.
+
+    Args:
+        url: Job URL (primary key).
+        status: Either 'approved' or 'rejected'.
+        notes: Optional reviewer note.
+        conn: Database connection. Uses get_connection() if None.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET approval_status = ?, approval_reviewed_at = ?, "
+        "approval_reviewer_notes = ? WHERE url = ?",
+        (status, now, notes or None, url),
+    )
+    conn.commit()
+
+
+def get_approval_stats(conn: sqlite3.Connection | None = None) -> dict:
+    """Return counts for the approval gate: pending / approved / rejected."""
+    if conn is None:
+        conn = get_connection()
+
+    return {
+        "pending": conn.execute(
+            "SELECT COUNT(*) FROM jobs "
+            "WHERE fit_score >= 7 AND full_description IS NOT NULL "
+            "AND approval_status IS NULL AND applied_at IS NULL"
+        ).fetchone()[0],
+        "approved": conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE approval_status = 'approved'"
+        ).fetchone()[0],
+        "rejected": conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE approval_status = 'rejected'"
+        ).fetchone()[0],
+    }
