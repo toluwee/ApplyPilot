@@ -35,6 +35,12 @@ IMPORTANT FACTORS:
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
 
+HARD DISQUALIFIERS (cap score at 3 regardless of skill match):
+- Location outside the United States, or remote roles restricted to a non-US country/region (e.g. "Remote - India", "Brazil", "UK only", "Canada only"). US-based or US-eligible remote roles are fine.
+- Internship, co-op, entry-level, junior, or early-career roles — the candidate is senior-level.
+- Generic aggregator/catch-all listings that are not a single concrete job (e.g. "AI Engineer Jobs in India", "Talent Network", "Freelancer Positions").
+If a disqualifier applies, state it as the first sentence of REASONING.
+
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
