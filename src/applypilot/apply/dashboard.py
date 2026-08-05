@@ -7,8 +7,8 @@ in a terminal dashboard using the Rich library.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Group
@@ -81,7 +81,7 @@ def add_event(msg: str) -> None:
     Args:
         msg: Rich markup string describing the event.
     """
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now(UTC).astimezone().strftime("%H:%M:%S")  # local wall clock
     with _lock:
         _events.append(f"[dim]{ts}[/dim] {msg}")
         if len(_events) > MAX_EVENTS:

@@ -17,24 +17,32 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (
-    launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT,
+    _kill_process_tree,
+    cleanup_on_exit,
+    cleanup_worker,
+    kill_all_chrome,
+    launch_chrome,
+    reset_worker_dir,
 )
 from applypilot.apply.dashboard import (
-    init_worker, update_state, add_event, get_state,
-    render_full, get_totals,
+    add_event,
+    get_state,
+    get_totals,
+    init_worker,
+    render_full,
+    update_state,
 )
+from applypilot.database import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +52,9 @@ def _load_blocked():
     return load_blocked_sites()
 
 # How often to poll the DB when the queue is empty (seconds)
-POLL_INTERVAL = config.DEFAULTS["poll_interval"]
+# Dict holder rather than a rebound module global, so run_apply_pipeline()
+# can override it without a `global` statement.
+_POLL = {"interval": config.DEFAULTS["poll_interval"]}
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
@@ -126,7 +136,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             approval_clause = "AND approval_status = 'approved'" if approved_only else ""
             row = conn.execute(f"""
@@ -140,7 +150,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   {approval_clause}
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY COALESCE(apply_attempts, 0) ASC, fit_score DESC, url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -160,7 +170,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
                            agent_id = ?,
@@ -180,7 +190,7 @@ def mark_result(url: str, status: str, error: str | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -259,7 +269,7 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         reason: Failure reason (only for status='failed').
     """
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -360,7 +370,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
-    ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts_header = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     log_header = (
         f"\n{'=' * 60}\n"
         f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
@@ -372,6 +382,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    watchdog = None
 
     try:
         proc = subprocess.Popen(
@@ -391,12 +402,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
 
+        # Watchdog: the stdout-reading loop below blocks indefinitely if the
+        # subprocess hangs (e.g. a stuck MCP tool call). Force-kill it if it
+        # runs past apply_timeout so the worker can move on to the next job.
+        watchdog = threading.Timer(config.DEFAULTS["apply_timeout"], proc.kill)
+        watchdog.daemon = True
+        watchdog.start()
+
         text_parts: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
-            for line in proc.stdout:
-                line = line.strip()
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
@@ -446,6 +464,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(line + "\n")
 
+        watchdog.cancel()
+        watchdog = None
         proc.wait(timeout=300)
         returncode = proc.returncode
         proc = None
@@ -457,7 +477,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(UTC).astimezone().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
@@ -509,11 +529,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
         return "failed:timeout", duration_ms
     except Exception as e:
+        # The worker records the failure and moves to the next job
+        logger.warning("Worker %d failed on %s", worker_id, job.get("url", "?"), exc_info=True)
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
@@ -594,9 +618,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             update_state(worker_id, status="idle",
                          last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
-                add_event(f"[W{worker_id}] Queue empty, polling every {POLL_INTERVAL}s...")
+                add_event(f"[W{worker_id}] Queue empty, polling every {_POLL['interval']}s...")
             # Use Event.wait for interruptible sleep
-            if _stop_event.wait(timeout=POLL_INTERVAL):
+            if _stop_event.wait(timeout=_POLL["interval"]):
                 break  # Stop was requested during wait
             continue
 
@@ -637,7 +661,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            mark_result(job["url"], "failed", str(e))
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -674,8 +698,7 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
     """
-    global POLL_INTERVAL
-    POLL_INTERVAL = poll_interval
+    _POLL["interval"] = poll_interval
     _stop_event.clear()
 
     config.ensure_dirs()
@@ -693,7 +716,10 @@ def main(limit: int = 1, target_url: str | None = None,
         init_worker(i)
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
-    console.print(f"Launching apply pipeline ({mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
+    console.print(
+        f"Launching apply pipeline ({mode_label}, {worker_label}, "
+        f"poll every {_POLL['interval']}s)..."
+    )
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
     # Double Ctrl+C handler
@@ -706,14 +732,14 @@ def main(limit: int = 1, target_url: str | None = None,
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
             # Kill all active Claude processes to skip current jobs
             with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+                for cproc in list(_claude_procs.values()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+                for cproc in list(_claude_procs.values()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
             kill_all_chrome()

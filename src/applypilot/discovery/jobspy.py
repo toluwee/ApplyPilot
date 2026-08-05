@@ -10,12 +10,12 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -106,20 +106,15 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
         if r.lower() in loc:
             return False
 
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    # No match -- reject unknown
-    return False
+    # Accept matches; no match -- reject unknown
+    return any(a.lower() in loc for a in accept)
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
 def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
@@ -129,7 +124,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-        company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
+        # NOTE: JobSpy also returns "company", but the jobs table has no column
+        # for it, so it is dropped here rather than parsed and discarded.
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
         # Build salary string from min/max
@@ -164,7 +160,12 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             detail_scraped_at = now
 
         # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        _job_url_direct = row.get("job_url_direct")
+        apply_url = (
+            str(_job_url_direct)
+            if _job_url_direct and str(_job_url_direct) != "nan"
+            else None
+        )
 
         try:
             conn.execute(
@@ -231,7 +232,8 @@ def _run_one_search(
             df = _scrape_with_retry(kwargs, max_retries=max_retries)
             all_dfs.append(df)
         except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
+            # Other sites in this search can still succeed
+            log.error("[%s] (non-gd): %s", label, e, exc_info=True)
 
     # Run Glassdoor separately with simplified location
     if has_glassdoor:
@@ -252,14 +254,15 @@ def _run_one_search(
             gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
             all_dfs.append(gd_df)
         except Exception as e:
-            log.error("[%s] (glassdoor): %s", label, e)
+            log.error("[%s] (glassdoor): %s", label, e, exc_info=True)
 
     if not all_dfs:
         log.error("[%s]: all sites failed", label)
         return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
 
-    import pandas as pd
     import warnings
+
+    import pandas as pd
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
@@ -330,7 +333,7 @@ def search_jobs(
     try:
         df = scrape_jobs(**kwargs)
     except Exception as e:
-        log.error("JobSpy search failed: %s", e)
+        log.error("JobSpy search failed: %s", e, exc_info=True)
         return {"error": str(e), "total": 0, "new": 0, "existing": 0}
 
     total = len(df)
@@ -383,15 +386,16 @@ def _full_crawl(
     if locations:
         locs = [loc for loc in locs if loc.get("label") in locations]
 
-    searches = []
-    for q in queries:
-        for loc in locs:
-            searches.append({
-                "query": q["query"],
-                "location": loc["location"],
-                "remote": loc.get("remote", False),
-                "tier": q.get("tier", 0),
-            })
+    searches = [
+        {
+            "query": q["query"],
+            "location": loc["location"],
+            "remote": loc.get("remote", False),
+            "tier": q.get("tier", 0),
+        }
+        for q in queries
+        for loc in locs
+    ]
 
     proxy_config = parse_proxy(proxy) if proxy else None
 
@@ -405,15 +409,13 @@ def _full_crawl(
     total_new = 0
     total_existing = 0
     total_errors = 0
-    completed = 0
 
-    for s in searches:
+    for completed, s in enumerate(searches, start=1):
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
         )
-        completed += 1
         total_new += result["new"]
         total_existing += result["existing"]
         total_errors += result["errors"]

@@ -4,6 +4,7 @@ Handles launching an isolated Chrome instance with remote debugging,
 worker profile setup/cloning, and cross-platform process cleanup.
 """
 
+import contextlib
 import json
 import logging
 import platform
@@ -45,6 +46,7 @@ def _kill_process_tree(pid: int) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
+                check=False,  # process may already be gone
             )
         else:
             # Unix: kill entire process group
@@ -52,11 +54,9 @@ def _kill_process_tree(pid: int) -> None:
             try:
                 os.killpg(os.getpgid(pid), _signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                # Process already gone or owned by another user
-                try:
+                # Process group already gone or owned by another user
+                with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(pid, _signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
     except Exception:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
 
@@ -70,7 +70,7 @@ def _kill_on_port(port: int) -> None:
         if platform.system() == "Windows":
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
             for line in result.stdout.splitlines():
                 if f":{port}" in line and "LISTENING" in line:
@@ -81,10 +81,10 @@ def _kill_on_port(port: int) -> None:
             # macOS / Linux
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, check=False,
             )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
+            for raw_pid in result.stdout.strip().splitlines():
+                pid_str = raw_pid.strip()
                 if pid_str.isdigit():
                     _kill_process_tree(int(pid_str))
     except FileNotFoundError:
@@ -236,7 +236,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         cmd.append("--headless=new")
 
     # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if platform.system() != "Windows":
         import os
         kwargs["preexec_fn"] = os.setsid

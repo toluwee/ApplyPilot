@@ -14,7 +14,7 @@ import sqlite3
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 
 import yaml
@@ -64,11 +64,7 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
         if r.lower() in loc:
             return False
 
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
+    return any(a.lower() in loc for a in accept)
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -115,14 +111,15 @@ def strip_html(html: str) -> str:
 
 # -- Proxy -------------------------------------------------------------------
 
-_opener = None
+# Dict holder rather than a rebound module global, so the setters below
+# need no `global` statement.
+_opener: dict[str, object] = {"value": None}
 
 
 def setup_proxy(proxy_str: str | None) -> None:
     """Configure a global urllib opener with proxy support."""
-    global _opener
     if not proxy_str:
-        _opener = urllib.request.build_opener()
+        _opener["value"] = urllib.request.build_opener()
         return
 
     parts = proxy_str.split(":")
@@ -133,21 +130,22 @@ def setup_proxy(proxy_str: str | None) -> None:
         proxy_url = f"http://{parts[0]}:{parts[1]}"
     else:
         log.warning("Proxy format not recognized: %s (expected host:port:user:pass or host:port)", proxy_str)
-        _opener = urllib.request.build_opener()
+        _opener["value"] = urllib.request.build_opener()
         return
 
     proxy_handler = urllib.request.ProxyHandler({
         "http": proxy_url,
         "https": proxy_url,
     })
-    _opener = urllib.request.build_opener(proxy_handler)
+    _opener["value"] = urllib.request.build_opener(proxy_handler)
     log.info("Proxy configured: %s:%s", parts[0], parts[1])
 
 
 def _urlopen(req, timeout=30):
     """Open a URL using the configured opener (with or without proxy)."""
-    if _opener:
-        return _opener.open(req, timeout=timeout)
+    opener = _opener["value"]
+    if opener:
+        return opener.open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -208,7 +206,8 @@ def search_employer(
         try:
             data = workday_search(employer, search_text, limit=page_size, offset=offset)
         except Exception as e:
-            log.error("%s: API error at offset %d: %s", employer["name"], offset, e)
+            # Stop paging this employer, but keep whatever was collected
+            log.error("%s: API error at offset %d: %s", employer["name"], offset, e, exc_info=True)
             break
 
         if total is None:
@@ -221,9 +220,9 @@ def search_employer(
 
         for j in postings:
             loc = j.get("locationsText", "")
-            if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs):
-                    continue
+            if (location_filter and accept_locs is not None and reject_locs is not None
+                    and not _location_ok(loc, accept_locs, reject_locs)):
+                continue
 
             all_jobs.append({
                 "title": j.get("title", ""),
@@ -266,6 +265,8 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
         job["remote_type"] = info.get("remoteType", "")
 
     except Exception as e:
+        # Error is recorded on the job row; the batch continues
+        log.debug("Detail fetch failed for %s", job.get("title", "?"), exc_info=True)
         job["full_description"] = ""
         job["apply_url"] = ""
         job["detail_error"] = str(e)
@@ -277,13 +278,11 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
     """Fetch full description + apply URL for each job sequentially."""
     log.info("%s: fetching details for %d jobs...", employer["name"], len(jobs))
 
-    completed = 0
     errors = 0
     t0 = time.time()
 
-    for job in jobs:
+    for completed, job in enumerate(jobs, start=1):
         _fetch_one_detail(employer, job)
-        completed += 1
         if "detail_error" in job:
             errors += 1
 
@@ -302,7 +301,7 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
 
 def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
@@ -359,7 +358,8 @@ def _process_one(
             reject_locs=reject_locs,
         )
     except Exception as e:
-        log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
+        # One employer failing must not stop the rest of the crawl
+        log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e, exc_info=True)
         return {"employer": emp["name"], "query": search_text,
                 "found": 0, "new": 0, "existing": 0, "error": str(e)}
 
@@ -370,7 +370,8 @@ def _process_one(
     try:
         jobs = fetch_details(emp, jobs)
     except Exception as e:
-        log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
+        log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e,
+                  exc_info=True)
 
     conn = get_connection()
     new, existing = store_results(conn, jobs, employers)
@@ -442,13 +443,11 @@ def scrape_employers(
                              search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
     else:
         # Sequential mode (default)
-        completed = 0
-        for key in valid_keys:
+        for completed, key in enumerate(valid_keys, start=1):
             result = _process_one(
                 key, employers, search_text,
                 location_filter, accept_locs, reject_locs,
             )
-            completed += 1
             total_new += result["new"]
             total_existing += result["existing"]
             total_found += result["found"]

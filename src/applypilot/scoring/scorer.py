@@ -5,13 +5,12 @@ job description. All personal data is loaded at runtime from the user's
 profile and resume file.
 """
 
-import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from applypilot.config import RESUME_PATH, load_profile
+from applypilot.config import RESUME_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -61,8 +60,8 @@ def _parse_score_response(response: str) -> dict:
     keywords = ""
     reasoning = response
 
-    for line in response.split("\n"):
-        line = line.strip()
+    for raw_line in response.split("\n"):
+        line = raw_line.strip()
         if line.startswith("SCORE:"):
             try:
                 score = int(re.search(r"\d+", line).group())
@@ -104,7 +103,8 @@ def score_job(resume_text: str, job: dict) -> dict:
         response = client.chat(messages, max_tokens=512, temperature=0.2)
         return _parse_score_response(response)
     except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
+        # A scoring failure records score 0 rather than aborting the batch
+        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e, exc_info=True)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
@@ -136,18 +136,16 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     # Convert sqlite3.Row to dicts if needed
     if jobs and not isinstance(jobs[0], dict):
         columns = jobs[0].keys()
-        jobs = [dict(zip(columns, row)) for row in jobs]
+        jobs = [dict(zip(columns, row, strict=True)) for row in jobs]
 
     log.info("Scoring %d jobs sequentially...", len(jobs))
     t0 = time.time()
-    completed = 0
     errors = 0
     results: list[dict] = []
 
-    for job in jobs:
+    for completed, job in enumerate(jobs, start=1):
         result = score_job(resume_text, job)
         result["url"] = job["url"]
-        completed += 1
 
         if result["score"] == 0:
             errors += 1
@@ -160,7 +158,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         )
 
     # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     for r in results:
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",

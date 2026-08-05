@@ -19,18 +19,16 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 from urllib.parse import quote_plus
 
-import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import get_stats, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -41,7 +39,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
-        pass
+        # Non-reconfigurable stream (e.g. redirected output) -- keep going
+        log.debug("Could not force UTF-8 on stdout/stderr", exc_info=True)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
@@ -64,13 +63,9 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     loc = location.lower()
     if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
         return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    if any(r.lower() in loc for r in reject):
+        return False
+    return any(a.lower() in loc for a in accept)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -94,7 +89,7 @@ def _store_jobs_filtered(
     reject_locs: list[str],
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
     filtered = 0
@@ -151,6 +146,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 try:
                     data = json.loads(body)
                 except Exception:
+                    log.debug("Intercepted response is not JSON: %s", rurl[:80], exc_info=True)
                     data = None
                 captured_responses.append({
                     "url": rurl,
@@ -159,7 +155,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                     "data": data,
                 })
             except Exception:
-                pass
+                log.debug("Could not read response body: %s", rurl[:80], exc_info=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -177,7 +173,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 data = json.loads(el.inner_text())
                 intel["json_ld"].append(data)
             except Exception:
-                pass
+                log.debug("Skipping malformed JSON-LD block", exc_info=True)
 
         # 2. __NEXT_DATA__
         next_data = page.query_selector("script#__NEXT_DATA__")
@@ -185,7 +181,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             try:
                 intel["next_data"] = json.loads(next_data.inner_text())
             except Exception:
-                pass
+                log.debug("Malformed __NEXT_DATA__ payload", exc_info=True)
 
         # 3. data-testid attributes
         intel["data_testids"] = page.evaluate("""
@@ -303,7 +299,9 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 summary["type"] = "object"
                 summary["keys"] = list(data.keys())[:20]
 
-                def _explore_nested(obj, path_prefix, depth=0):
+                # summary is passed explicitly rather than captured: the closure
+                # would otherwise late-bind the loop variable.
+                def _explore_nested(obj, path_prefix, summary, depth=0):
                     if depth > 3 or not isinstance(obj, dict):
                         return
                     for key in list(obj.keys())[:15]:
@@ -331,8 +329,8 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                                     }
                             summary[f"nested_{path}"] = info
                         elif isinstance(val, dict) and depth < 3:
-                            _explore_nested(val, path, depth + 1)
-                _explore_nested(data, "")
+                            _explore_nested(val, path, summary, depth + 1)
+                _explore_nested(data, "", summary)
         intel["api_responses"].append(summary)
 
     return intel
@@ -402,7 +400,8 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
             if is_relevant:
                 relevant.append(resp)
         except Exception as e:
-            log.warning("Judge ERROR for %s: %s -- keeping", resp.get("url", "?")[:80], e)
+            # Fail open: a judge error keeps the response rather than dropping data
+            log.warning("Judge ERROR for %s: %s -- keeping", resp.get("url", "?")[:80], e, exc_info=True)
             relevant.append(resp)
 
     return relevant
@@ -424,7 +423,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -668,7 +667,7 @@ def extract_json(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    while text.endswith("}") or text.endswith("]"):
+    while text.endswith(("}", "]")):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -796,7 +795,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     try:
         raw, elapsed, meta = ask_llm(prompt)
     except Exception as e:
-        log.error("LLM_ERROR in Phase 2: %s", e)
+        log.error("LLM_ERROR in Phase 2: %s", e, exc_info=True)
         return {}, []
 
     log.info("Phase 2 LLM: %d chars, %.1fs", meta['response_chars'], elapsed)
@@ -804,7 +803,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     try:
         selectors = extract_json(raw)
     except Exception as e:
-        log.error("PARSE_ERROR in Phase 2: %s | raw: %s", e, raw[:500])
+        log.error("PARSE_ERROR in Phase 2: %s | raw: %s", e, raw[:500], exc_info=True)
         return {}, []
 
     if "error" in selectors:
@@ -819,7 +818,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     try:
         cards = soup.select(card_sel)
     except Exception as e:
-        log.error("Invalid card selector '%s': %s", card_sel, e)
+        log.error("Invalid card selector '%s': %s", card_sel, e, exc_info=True)
         return selectors, []
 
     log.info("Matched %d cards", len(cards))
@@ -835,6 +834,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
             try:
                 el = card.select_one(sel)
             except Exception:
+                log.debug("Invalid %s selector %r on card", field, sel, exc_info=True)
                 job[field] = None
                 continue
             if el:
@@ -890,7 +890,7 @@ def _run_one_site(name: str, url: str) -> dict:
     try:
         raw, elapsed, meta = ask_llm(prompt)
     except Exception as e:
-        log.error("LLM_ERROR: %s", e)
+        log.error("LLM_ERROR: %s", e, exc_info=True)
         return {"name": name, "status": "LLM_ERROR", "error": str(e)}
 
     log.info("LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
@@ -898,7 +898,7 @@ def _run_one_site(name: str, url: str) -> dict:
     try:
         plan = extract_json(raw)
     except Exception as e:
-        log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500])
+        log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500], exc_info=True)
         return {"name": name, "status": "PARSE_ERROR", "error": str(e), "raw": raw}
 
     strategy = plan.get("strategy", "?")
@@ -922,7 +922,8 @@ def _run_one_site(name: str, url: str) -> dict:
             log.warning("Unknown strategy: %s", strategy)
             jobs = []
     except Exception as e:
-        log.error("EXECUTION_ERROR: %s", e)
+        # One site's strategy failing must not abort the whole crawl
+        log.error("EXECUTION_ERROR: %s", e, exc_info=True)
         return {"name": name, "status": "EXEC_ERROR", "error": str(e), "plan": plan}
 
     # Step 4: Report

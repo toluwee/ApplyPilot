@@ -52,3 +52,34 @@ artifacts = ["src/applypilot/config/*.yaml"]
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+# Pin the rule set explicitly. Without this, `ruff check` inherits whatever the
+# installed ruff version happens to default to, so the same code lints clean on
+# one machine and fails CI on another.
+[tool.ruff.lint]
+select = [
+    "F",     # pyflakes
+    "E4", "E7", "E9",  # pycodestyle (E501 line length is handled by the formatter)
+    "I",     # import sorting
+    "UP",    # pyupgrade
+    "B",     # bugbear
+    "C4",    # comprehensions
+    "SIM",   # simplify
+    "PIE",   # misc lints
+    "PERF",  # performance
+    "DTZ",   # naive datetimes
+    "PLW",   # pylint warnings
+    "BLE",   # blind except
+    "S110", "S112",  # silently swallowed exceptions
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer.Option()/typer.Argument() in argument defaults IS the Typer API --
+# "fixing" B008 here would break every CLI flag.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is the point of a test
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

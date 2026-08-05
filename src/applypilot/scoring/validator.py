@@ -11,8 +11,8 @@ normal  -- banned words = warnings only; fabrication/structure = errors (default
 lenient -- banned words ignored; only fabrication and required structure checked
 """
 
-import re
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -78,9 +78,7 @@ def _build_skills_set(profile: dict) -> set[str]:
     boundary = profile.get("skills_boundary", {})
     allowed: set[str] = set()
     for category in boundary.values():
-        if isinstance(category, list):
-            allowed.update(s.lower().strip() for s in category)
-        elif isinstance(category, set):
+        if isinstance(category, (list, set)):
             allowed.update(s.lower().strip() for s in category)
     return allowed
 
@@ -115,9 +113,11 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     # Required keys — always checked regardless of mode
     # projects is allowed to be an empty list (some jobs have no relevant projects)
-    for key in ("title", "summary", "skills", "experience", "education"):
-        if key not in data or not data[key]:
-            errors.append(f"Missing required field: {key}")
+    errors.extend(
+        f"Missing required field: {key}"
+        for key in ("title", "summary", "skills", "experience", "education")
+        if key not in data or not data[key]
+    )
     if "projects" not in data:
         errors.append("Missing required field: projects")
     if errors:
@@ -149,14 +149,12 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            all_text_parts.extend(entry.get("bullets", []))
 
     # Projects: collect bullets
     if isinstance(data["projects"], list):
         for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            all_text_parts.extend(entry.get("bullets", []))
 
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
@@ -224,14 +222,18 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         warnings.append(f"Name '{full_name}' missing -- will be injected")
 
     # 3. Check companies preserved
-    for company in resume_facts.get("preserved_companies", []):
-        if company.lower() not in text_lower:
-            errors.append(f"Company '{company}' missing -- cannot remove real experience")
+    errors.extend(
+        f"Company '{company}' missing -- cannot remove real experience"
+        for company in resume_facts.get("preserved_companies", [])
+        if company.lower() not in text_lower
+    )
 
     # 4. Check projects preserved
-    for project in resume_facts.get("preserved_projects", []):
-        if project.lower() not in text_lower:
-            warnings.append(f"Project '{project}' not found -- may have been renamed")
+    warnings.extend(
+        f"Project '{project}' not found -- may have been renamed"
+        for project in resume_facts.get("preserved_projects", [])
+        if project.lower() not in text_lower
+    )
 
     # 5. Check school preserved
     preserved_school = resume_facts.get("preserved_school", "")

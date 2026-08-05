@@ -12,6 +12,7 @@ LLM_MODEL env var overrides the model name for any provider.
 import logging
 import os
 import time
+from functools import lru_cache
 
 import httpx
 
@@ -286,14 +287,13 @@ class _GeminiCompatForbidden(Exception):
 # Singleton
 # ---------------------------------------------------------------------------
 
-_instance: LLMClient | None = None
-
-
+@lru_cache(maxsize=1)
 def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
-    global _instance
-    if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
-    return _instance
+    """Return (or create) the module-level LLMClient singleton.
+
+    lru_cache gives the same lazy-singleton behaviour as a module global
+    without a `global` statement; call get_client.cache_clear() to reset.
+    """
+    base_url, model, api_key = _detect_provider()
+    log.info("LLM provider: %s  model: %s", base_url, model)
+    return LLMClient(base_url, model, api_key)

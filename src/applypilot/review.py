@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
-from rich import box
 
 from applypilot.database import get_connection, get_pending_review, set_approval
 
@@ -157,7 +157,7 @@ def run_review(
         console.print()
         console.print(table)
         console.print(
-            f"  Run [bold]applypilot review[/bold] (no flags) to approve/reject interactively.\n"
+            "  Run [bold]applypilot review[/bold] (no flags) to approve/reject interactively.\n"
         )
         return
 
@@ -186,7 +186,7 @@ def run_review(
             approved_count += 1
         elif decision == "rejected":
             set_approval(job["url"], "rejected", notes=job_note, conn=conn)
-            console.print(f"  [red]✗ Rejected[/red]" + (f" — {job_note}" if job_note else ""))
+            console.print("  [red]✗ Rejected[/red]" + (f" — {job_note}" if job_note else ""))
             rejected_count += 1
         elif decision == "skip":
             console.print("  [dim]— Skipped[/dim]")
