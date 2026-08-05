@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -27,6 +26,9 @@ log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
 VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+# Precomputed for the --help text: building it inline would put a function
+# call in an argument default.
+_STAGES_HELP = ", ".join(VALID_STAGES)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 def _bootstrap() -> None:
     """Common setup: load env, create dirs, init DB."""
-    from applypilot.config import load_env, ensure_dirs
+    from applypilot.config import ensure_dirs, load_env
     from applypilot.database import init_db
 
     load_env()
@@ -75,11 +77,11 @@ def init() -> None:
 
 @app.command()
 def run(
-    stages: Optional[list[str]] = typer.Argument(
+    stages: list[str] | None = typer.Argument(
         None,
         help=(
             "Pipeline stages to run. "
-            f"Valid: {', '.join(VALID_STAGES)}, all. "
+            f"Valid: {_STAGES_HELP}, all. "
             "Defaults to 'all' if omitted."
         ),
     ),
@@ -145,8 +147,8 @@ def run(
 @app.command()
 def review(
     list_: bool = typer.Option(False, "--list", help="List jobs pending review."),
-    approve: Optional[str] = typer.Option(None, "--approve", help="Approve a specific job by URL."),
-    reject: Optional[str] = typer.Option(None, "--reject", help="Reject a specific job by URL."),
+    approve: str | None = typer.Option(None, "--approve", help="Approve a specific job by URL."),
+    reject: str | None = typer.Option(None, "--reject", help="Reject a specific job by URL."),
     note: str = typer.Option("", "--note", help="Note to attach to the approval/rejection decision."),
 ) -> None:
     """Review tailored jobs and approve or reject them before auto-applying."""
@@ -158,7 +160,7 @@ def review(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
+    limit: int | None = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
@@ -166,17 +168,18 @@ def apply(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     approved_only: bool = typer.Option(False, "--approved-only", help="Only apply to jobs approved via 'applypilot review'."),
-    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    url: str | None = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
-    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
-    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
-    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
+    mark_applied: str | None = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
+    mark_failed: str | None = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
+    fail_reason: str | None = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import PROFILE_PATH as _profile_path
+    from applypilot.config import check_tier
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -226,7 +229,7 @@ def apply(
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -237,7 +240,7 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
             f"  claude --model {model} -p "
             f"--mcp-config {mcp_path} "
@@ -256,7 +259,7 @@ def apply(
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if approved_only:
-        console.print(f"  Gate:     approved jobs only")
+        console.print("  Gate:     approved jobs only")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -346,9 +349,9 @@ def status() -> None:
 @app.command()
 def dashboard(
     port: int = typer.Option(7410, "--port", help="Port for the local dashboard server."),
-    no_server: bool = typer.Option(False, "--no-server", help="Generate a static HTML snapshot only (no server, approve/reject disabled)."),
+    no_server: bool = typer.Option(False, "--no-server", help="Generate a static HTML snapshot only (no server, interactive controls disabled)."),
 ) -> None:
-    """Start the interactive review dashboard in your browser."""
+    """Start the review + ready-to-apply dashboard in your browser."""
     _bootstrap()
 
     if no_server:
@@ -363,9 +366,14 @@ def dashboard(
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
+
     from applypilot.config import (
-        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        PROFILE_PATH,
+        RESUME_PATH,
+        RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH,
+        get_chrome_path,
+        load_env,
     )
 
     load_env()
@@ -467,7 +475,7 @@ def doctor() -> None:
     console.print()
 
     # Tier summary
-    from applypilot.config import get_tier, TIER_LABELS
+    from applypilot.config import TIER_LABELS, get_tier
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 

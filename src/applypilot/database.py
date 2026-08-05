@@ -7,7 +7,7 @@ without migration ordering issues.
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from applypilot.config import DB_PATH
@@ -361,7 +361,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
@@ -443,7 +443,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     # Convert sqlite3.Row objects to dicts
     if rows:
         columns = rows[0].keys()
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(zip(columns, row, strict=True)) for row in rows]
     return []
 
 
@@ -468,7 +468,7 @@ def get_pending_review(conn: sqlite3.Connection | None = None) -> list[dict]:
 
     if rows:
         columns = rows[0].keys()
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(zip(columns, row, strict=True)) for row in rows]
     return []
 
 
@@ -485,7 +485,7 @@ def set_approval(url: str, status: str, notes: str = "",
     if conn is None:
         conn = get_connection()
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     conn.execute(
         "UPDATE jobs SET approval_status = ?, approval_reviewed_at = ?, "
         "approval_reviewer_notes = ? WHERE url = ?",
@@ -511,4 +511,74 @@ def get_approval_stats(conn: sqlite3.Connection | None = None) -> dict:
         "rejected": conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE approval_status = 'rejected'"
         ).fetchone()[0],
+        "ready_to_apply": conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE {_READY_TO_APPLY_WHERE}"
+        ).fetchone()[0],
     }
+
+
+# Approved + tailored jobs the user still has to submit by hand.
+#
+# applied_at IS NULL is the real "not done yet" test. The apply_status list
+# deliberately readmits jobs the auto-apply bot left stranded: 'in_progress'
+# rows are locks from a worker that was killed mid-run and never released,
+# 'manual' means the bot skipped a manual-only ATS, and 'failed' means it gave
+# up. All three still need a human, so they belong on the manual queue.
+#
+# A cover letter is NOT required — matching acquire_job() in apply/launcher.py,
+# and because a missing cover letter shouldn't hide an otherwise applyable job.
+_READY_TO_APPLY_WHERE = """
+    approval_status = 'approved'
+    AND tailored_resume_path IS NOT NULL
+    AND applied_at IS NULL
+    AND (apply_status IS NULL OR apply_status IN ('failed', 'manual', 'in_progress'))
+"""
+
+
+def get_ready_to_apply(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return approved + tailored jobs awaiting a manual application.
+
+    These are the jobs whose resume and cover letter have already been
+    generated, ordered best-fit first, so the user can open each posting and
+    apply by hand.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute(f"""
+        SELECT url, title, site, location, salary, fit_score, score_reasoning,
+               application_url, tailored_resume_path, cover_letter_path,
+               apply_status, apply_error, approval_reviewed_at
+        FROM jobs
+        WHERE {_READY_TO_APPLY_WHERE}
+        ORDER BY fit_score DESC, approval_reviewed_at DESC
+    """).fetchall()
+
+    if rows:
+        columns = rows[0].keys()
+        return [dict(zip(columns, row, strict=True)) for row in rows]
+    return []
+
+
+def mark_applied_manual(url: str, conn: sqlite3.Connection | None = None) -> None:
+    """Record that the user applied to this job themselves.
+
+    Writes the same apply_status='applied' the bot uses, so reset_failed()
+    won't clear it and acquire_job() won't pick the job up again. The
+    agent_id='self' marker is what distinguishes a hand-submitted application
+    from one the auto-apply worker made.
+
+    Args:
+        url: Job URL (primary key).
+        conn: Database connection. Uses get_connection() if None.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "UPDATE jobs SET apply_status = 'applied', applied_at = ?, "
+        "agent_id = 'self', apply_error = NULL WHERE url = ?",
+        (now, url),
+    )
+    conn.commit()

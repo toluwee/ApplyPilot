@@ -2,6 +2,7 @@
 
 Generates a self-contained HTML dashboard with:
   - Review queue: approve/reject scored jobs before tailoring
+  - Ready to apply: approved jobs with their generated resume + cover letter
   - Summary stats (total, enriched, scored, high-fit)
   - Score distribution bar chart
   - Jobs-by-source breakdown
@@ -12,32 +13,90 @@ Generates a self-contained HTML dashboard with:
 from __future__ import annotations
 
 import json
-import os
+import logging
 import threading
 import webbrowser
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot.config import APP_DIR
 from applypilot.database import get_connection
 
 console = Console()
+log = logging.getLogger(__name__)
+
+# Why the auto-apply bot left a job for the human to finish.
+_STRANDED_REASONS = {
+    "in_progress": "Auto-apply interrupted",
+    "manual": "ATS requires manual apply",
+}
 
 
-def _build_html(conn) -> str:
-    """Build the full dashboard HTML string from the current DB state."""
-    from applypilot.database import get_pending_review, set_approval  # noqa: F401 (used in serve path)
+def _doc_links(job_url: str, txt_path: str | None, kind: str, live: bool) -> str:
+    """Render the links for one generated document (resume or cover letter).
+
+    PDFs have no database column — convert_to_pdf() writes them next to the
+    source .txt at the same stem, so the path is re-derived here the same way
+    apply/prompt.py does. PDF generation is best-effort, so a missing PDF
+    degrades to the .txt rather than a broken link.
+
+    In served mode the files go through /api/file. In the static snapshot the
+    page's own origin is already file://, so same-scheme file:// links work
+    (a served page could not link to them — browsers block that downgrade).
+    """
+    if not txt_path:
+        return '<span class="doc-missing">not generated</span>'
+
+    txt = Path(txt_path)
+    pdf = txt.with_suffix(".pdf")
+    has_txt, has_pdf = txt.is_file(), pdf.is_file()
+
+    if not has_txt and not has_pdf:
+        return '<span class="doc-missing">file missing from disk</span>'
+
+    def href(path: Path, fmt: str) -> str:
+        if not live:
+            return escape(path.resolve().as_uri())
+        return f"/api/file?url={quote(job_url, safe='')}&amp;kind={kind}&amp;fmt={fmt}"
+
+    parts = []
+    if has_pdf:
+        parts.append(f'<a class="doc-link" href="{href(pdf, "pdf")}" target="_blank">PDF</a>')
+    if has_txt:
+        parts.append(f'<a class="doc-link-alt" href="{href(txt, "txt")}" target="_blank">txt</a>')
+
+    if not has_pdf:
+        # `applypilot run pdf` only scans TAILORED_DIR (scoring/pdf.py
+        # batch_convert), so it can never produce a cover-letter PDF —
+        # don't suggest a command that won't help.
+        hint = ("no PDF — run <code>applypilot run pdf</code>" if kind == "resume"
+                else "text only")
+        parts.append(f'<span class="doc-missing">{hint}</span>')
+    return " ".join(parts)
+
+
+def _build_html(conn, live: bool = True) -> str:
+    """Build the full dashboard HTML string from the current DB state.
+
+    Args:
+        conn: Database connection to read from.
+        live: True when served by serve_dashboard(), so the /api/* routes
+            exist. False for the static snapshot, where document links and
+            the Mark Applied button are rendered inert instead of broken.
+    """
+    # get_pending_review/set_approval are re-exported for the serve path
+    from applypilot.database import (  # noqa: F401
+        get_pending_review,
+        get_ready_to_apply,
+        set_approval,
+    )
 
     # Stats
     total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    ready = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
-    ).fetchone()[0]
     scored = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
     ).fetchone()[0]
@@ -65,7 +124,11 @@ def _build_html(conn) -> str:
           AND applied_at IS NULL
         ORDER BY fit_score DESC, discovered_at DESC
     """).fetchall()
-    review_jobs = [dict(zip(r.keys(), r)) for r in review_rows] if review_rows else []
+    review_jobs = [dict(zip(r.keys(), r, strict=True)) for r in review_rows] if review_rows else []
+
+    # Approved + tailored jobs still awaiting a manual application
+    ready_jobs = get_ready_to_apply(conn)
+    ready_count = len(ready_jobs)
 
     # Score distribution
     score_dist: dict[int, int] = {}
@@ -177,6 +240,83 @@ def _build_html(conn) -> str:
 <div class="review-section review-empty">
   <h2 class="review-heading">Review Queue <span class="rq-badge" style="background:#334155">0</span></h2>
   <p style="color:#64748b;font-size:0.9rem">No jobs pending review. Run <code>applypilot run score</code> to score new jobs.</p>
+</div>"""
+
+    # --- Ready to apply cards ---
+    ready_cards = []
+    for j in ready_jobs:
+        score = j.get("fit_score", 0) or 0
+        title = escape(j.get("title") or "Untitled")
+        url_raw = j.get("url") or ""
+        url_esc = escape(url_raw)
+        site = escape(j.get("site") or "")
+        location = escape((j.get("location") or "")[:40])
+        salary = escape(j.get("salary") or "")
+        site_color = colors.get(j.get("site") or "", "#6b7280")
+        score_color = "#10b981" if score >= 9 else ("#34d399" if score >= 8 else "#60a5fa")
+
+        # Prefer the direct application URL; fall back to the listing itself
+        post_url = escape(j.get("application_url") or url_raw)
+
+        resume_html = _doc_links(url_raw, j.get("tailored_resume_path"), "resume", live)
+        cover_html = _doc_links(url_raw, j.get("cover_letter_path"), "cover", live)
+
+        status = j.get("apply_status")
+        reason = _STRANDED_REASONS.get(status or "")
+        if status == "failed":
+            reason = f"Auto-apply failed: {(j.get('apply_error') or 'unknown')[:60]}"
+        stranded_html = f'<div class="stranded-note">{escape(reason)}</div>' if reason else ""
+
+        btn_html = (
+            '<button class="btn-applied" onclick="markApplied(this)">&#10003; Mark as Applied</button>'
+            if live else
+            '<button class="btn-applied" disabled title="Start the dashboard server to use this">&#10003; Mark as Applied</button>'
+        )
+
+        ready_cards.append(f"""
+        <div class="ready-card" data-url="{url_esc}">
+          <div class="rq-header">
+            <span class="score-pill" style="background:{score_color}">{score}</span>
+            <a href="{post_url}" class="job-title" target="_blank">{title}</a>
+            <div style="margin-left:auto;flex-shrink:0">{btn_html}</div>
+          </div>
+          <div class="meta-row">
+            <span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>
+            {f'<span class="meta-tag salary">{salary}</span>' if salary else ''}
+            {f'<span class="meta-tag location">{location}</span>' if location else ''}
+          </div>
+          {stranded_html}
+          <div class="doc-row"><span class="doc-label">Resume</span>{resume_html}</div>
+          <div class="doc-row"><span class="doc-label">Cover</span>{cover_html}</div>
+          <div class="card-footer">
+            <a href="{post_url}" class="apply-link" target="_blank">Open job posting &rarr;</a>
+          </div>
+        </div>""")
+
+    static_note = (
+        '<p class="static-note">Static snapshot &mdash; documents open from disk, but '
+        'run <code>applypilot dashboard</code> to mark jobs as applied.</p>'
+        if not live else ""
+    )
+
+    if ready_jobs:
+        ready_html = f"""
+<div class="ready-section" id="ready-section">
+  <h2 class="ready-heading">
+    Ready to Apply
+    <span class="ready-badge" id="ready-badge">{ready_count}</span>
+    <span style="font-size:0.75rem;font-weight:400;color:#94a3b8;margin-left:0.5rem">Open each posting and apply with the generated documents</span>
+  </h2>
+  {static_note}
+  <div class="ready-grid" id="ready-grid">
+    {"".join(ready_cards)}
+  </div>
+</div>"""
+    else:
+        ready_html = """
+<div class="ready-section review-empty">
+  <h2 class="ready-heading">Ready to Apply <span class="ready-badge" style="background:#334155">0</span></h2>
+  <p style="color:#64748b;font-size:0.9rem">Nothing ready yet. Approve jobs above, then run <code>applypilot run tailor cover pdf</code>.</p>
 </div>"""
 
     # --- Score distribution bar chart ---
@@ -320,6 +460,7 @@ def _build_html(conn) -> str:
   .approval-pill.pending .num {{ color: #fb923c; }}
   .approval-pill.approved .num {{ color: #4ade80; }}
   .approval-pill.rejected .num {{ color: #f87171; }}
+  .approval-pill.ready .num {{ color: #4ade80; }}
 
   /* Review queue */
   .review-section {{ margin-bottom: 2.5rem; }}
@@ -345,6 +486,26 @@ def _build_html(conn) -> str:
   .decided-badge.rejected {{ background: #450a0a; color: #f87171; }}
   .apply-tag {{ background: #1e3a5f; color: #93c5fd; text-decoration: none; }}
   .apply-tag:hover {{ background: #1e40af; }}
+
+  /* Ready to apply */
+  .ready-section {{ margin-bottom: 2.5rem; }}
+  .ready-heading {{ font-size: 1.3rem; font-weight: 700; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.6rem; border-bottom: 3px solid #4ade80; padding-bottom: 0.5rem; }}
+  .ready-badge {{ background: #4ade80; color: #0f172a; border-radius: 9999px; padding: 0.1rem 0.55rem; font-size: 0.8rem; font-weight: 700; }}
+  .ready-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 1rem; }}
+  .ready-card {{ background: #1e293b; border-radius: 10px; padding: 1rem; border-left: 3px solid #4ade80; transition: all 0.2s; }}
+  .ready-card.decided {{ opacity: 0.5; border-left-color: #334155; }}
+  .btn-applied {{ background: #064e3b; color: #4ade80; border: 1px solid #16a34a; border-radius: 6px; padding: 0.35rem 0.85rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }}
+  .btn-applied:hover {{ background: #065f46; }}
+  .btn-applied:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  .doc-row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.78rem; }}
+  .doc-label {{ color: #64748b; width: 3.8rem; flex-shrink: 0; font-weight: 600; }}
+  .doc-link {{ color: #4ade80; text-decoration: none; padding: 0.2rem 0.6rem; border: 1px solid #4ade8044; border-radius: 6px; }}
+  .doc-link:hover {{ background: #4ade8022; }}
+  .doc-link-alt {{ color: #94a3b8; text-decoration: none; padding: 0.2rem 0.5rem; border: 1px solid #47556944; border-radius: 6px; }}
+  .doc-link-alt:hover {{ background: #33415566; color: #e2e8f0; }}
+  .doc-missing {{ color: #64748b; font-style: italic; }}
+  .stranded-note {{ font-size: 0.75rem; color: #fbbf24; background: #78350f33; border-radius: 6px; padding: 0.25rem 0.6rem; margin-bottom: 0.3rem; display: inline-block; }}
+  .static-note {{ font-size: 0.8rem; color: #fbbf24; margin-bottom: 0.75rem; }}
 
   /* Filters */
   .filters {{ background: #1e293b; border-radius: 12px; padding: 1.25rem; margin-bottom: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }}
@@ -440,9 +601,12 @@ def _build_html(conn) -> str:
   <div class="approval-pill pending"><span class="num" id="pill-pending">{pending_review}</span> pending review</div>
   <div class="approval-pill approved"><span class="num" id="pill-approved">{approved_count}</span> approved</div>
   <div class="approval-pill rejected"><span class="num" id="pill-rejected">{rejected_count}</span> rejected</div>
+  <div class="approval-pill ready"><span class="num" id="pill-ready">{ready_count}</span> ready to apply</div>
 </div>
 
 {review_queue_html}
+
+{ready_html}
 
 <div class="filters">
   <span class="filter-label">Score:</span>
@@ -475,6 +639,7 @@ let searchText = '';
 let pendingCount = {pending_review};
 let approvedCount = {approved_count};
 let rejectedCount = {rejected_count};
+let readyCount = {ready_count};
 
 function filterScore(min, event) {{
   minScore = min;
@@ -522,6 +687,10 @@ function updateCounters() {{
   document.getElementById('pill-rejected').textContent = rejectedCount;
   const badge = document.getElementById('rq-badge');
   if (badge) badge.textContent = pendingCount;
+  const pillReady = document.getElementById('pill-ready');
+  if (pillReady) pillReady.textContent = readyCount;
+  const readyBadge = document.getElementById('ready-badge');
+  if (readyBadge) readyBadge.textContent = readyCount;
 }}
 
 function submitReviewCard(btn, action) {{
@@ -574,6 +743,37 @@ async function submitReview(card, action, note) {{
   }}
 }}
 
+async function markApplied(btn) {{
+  const card = btn.closest('.ready-card');
+  const url = card.dataset.url;
+  btn.disabled = true;
+
+  try {{
+    const resp = await fetch('/api/applied', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ url }})
+    }});
+    if (!resp.ok) throw new Error(await resp.text());
+
+    // Keep the card visible but dimmed so a misclick is obvious;
+    // it disappears on the next reload.
+    card.classList.add('decided');
+    btn.remove();
+    const header = card.querySelector('.rq-header');
+    const badge = document.createElement('span');
+    badge.className = 'decided-badge approved';
+    badge.textContent = '✓ Applied';
+    if (header) header.appendChild(badge);
+
+    readyCount--;
+    updateCounters();
+  }} catch (err) {{
+    btn.disabled = false;
+    alert('Error: ' + err.message + '\\n\\nMake sure the dashboard server is running:\\n  applypilot dashboard');
+  }}
+}}
+
 applyFilters();
 
 // Lazy-load full descriptions when <details> is opened
@@ -612,7 +812,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
     """
     out = Path(output_path) if output_path else APP_DIR / "dashboard.html"
     conn = get_connection()
-    html = _build_html(conn)
+    # Static snapshot: no /api/* routes, so interactive controls render inert
+    html = _build_html(conn, live=False)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
@@ -637,11 +838,15 @@ def serve_dashboard(port: int = 7410) -> None:
     """Start a local HTTP server serving the interactive dashboard.
 
     Handles:
-      GET  /           — live dashboard HTML (reads DB on each request)
-      POST /api/review — approve or reject a job: {url, action, note?}
+      GET  /            — live dashboard HTML (reads DB on each request)
+      POST /api/review  — approve or reject a job: {url, action, note?}
+      POST /api/applied — mark a job as applied by hand: {url}
       GET  /api/pending — current approval counts as JSON
+      GET  /api/file    — serve a generated resume/cover letter:
+                          ?url=<job>&kind=resume|cover&fmt=pdf|txt
     """
-    from applypilot.database import set_approval, get_approval_stats
+    from applypilot.config import COVER_LETTER_DIR, TAILORED_DIR
+    from applypilot.database import get_approval_stats, mark_applied_manual, set_approval
 
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # silence default access log
@@ -679,6 +884,61 @@ def serve_dashboard(port: int = 7410) -> None:
                 self.wfile.write(body)
                 return
 
+            if parsed.path == "/api/file":
+                params = parse_qs(parsed.query)
+                job_url = params.get("url", [""])[0]
+                kind = params.get("kind", ["resume"])[0]
+                fmt = params.get("fmt", ["pdf"])[0]
+
+                # Column name is chosen from a fixed pair, never interpolated
+                # from the query string; the filesystem path then comes from
+                # the DB row, so there is no traversal vector.
+                if kind == "resume":
+                    column, root = "tailored_resume_path", TAILORED_DIR
+                elif kind == "cover":
+                    column, root = "cover_letter_path", COVER_LETTER_DIR
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+                row = get_connection().execute(
+                    f"SELECT {column} FROM jobs WHERE url = ?", (job_url,)
+                ).fetchone()
+                if not row or not row[0]:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                path = Path(row[0])
+                if fmt == "pdf":
+                    path = path.with_suffix(".pdf")
+
+                # Defence in depth: the file must live in the directory the
+                # generator writes to, even if the DB row were tampered with.
+                try:
+                    resolved = path.resolve()
+                    resolved.relative_to(Path(root).resolve())
+                except (ValueError, OSError):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+
+                if not resolved.is_file():
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                body = resolved.read_bytes()
+                ctype = "application/pdf" if fmt == "pdf" else "text/plain; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Disposition", f'inline; filename="{resolved.name}"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if parsed.path == "/":
                 conn = get_connection()
                 html = _build_html(conn)
@@ -708,6 +968,24 @@ def serve_dashboard(port: int = 7410) -> None:
                     set_approval(url, action, notes=note)
                     self._send_json({"ok": True})
                 except Exception as exc:
+                    # Never let a bad request kill the server thread
+                    log.exception("Review request failed")
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if self.path == "/api/applied":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body)
+                    url = data.get("url", "").strip()
+                    if not url:
+                        self._send_json({"error": "url required"}, 400)
+                        return
+                    mark_applied_manual(url)
+                    self._send_json({"ok": True})
+                except Exception as exc:
+                    log.exception("Mark-applied request failed")
                     self._send_json({"error": str(exc)}, 500)
                 return
 
@@ -726,7 +1004,8 @@ def serve_dashboard(port: int = 7410) -> None:
 
     console.print(f"\n[bold green]ApplyPilot Dashboard[/bold green] running at [bold]{url}[/bold]")
     console.print("  Approve/Reject jobs in the [bold]Review Queue[/bold] section.")
-    console.print("  After reviewing, run [bold]applypilot run tailor cover[/bold] to process approved jobs.")
+    console.print("  After reviewing, run [bold]applypilot run tailor cover pdf[/bold] to process approved jobs.")
+    console.print("  Then use [bold]Ready to Apply[/bold] to open each posting with its resume and cover letter.")
     console.print("  Press [bold]Ctrl+C[/bold] to stop.\n")
 
     try:
