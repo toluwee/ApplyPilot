@@ -15,14 +15,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.config import ensure_dirs, load_env
+from applypilot.database import get_connection, get_stats, init_db
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -70,7 +70,7 @@ def _run_discover(workers: int = 1) -> dict:
         run_discovery()
         stats["jobspy"] = "ok"
     except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
+        log.error("JobSpy crawl failed: %s", e, exc_info=True)
         console.print(f"  [red]JobSpy error:[/red] {e}")
         stats["jobspy"] = f"error: {e}"
 
@@ -81,7 +81,7 @@ def _run_discover(workers: int = 1) -> dict:
         run_workday_discovery(workers=workers)
         stats["workday"] = "ok"
     except Exception as e:
-        log.error("Workday scraper failed: %s", e)
+        log.error("Workday scraper failed: %s", e, exc_info=True)
         console.print(f"  [red]Workday error:[/red] {e}")
         stats["workday"] = f"error: {e}"
 
@@ -92,7 +92,7 @@ def _run_discover(workers: int = 1) -> dict:
         run_smart_extract(workers=workers)
         stats["smartextract"] = "ok"
     except Exception as e:
-        log.error("Smart extract failed: %s", e)
+        log.error("Smart extract failed: %s", e, exc_info=True)
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
@@ -106,7 +106,7 @@ def _run_enrich(workers: int = 1) -> dict:
         run_enrichment(workers=workers)
         return {"status": "ok"}
     except Exception as e:
-        log.error("Enrichment failed: %s", e)
+        log.error("Enrichment failed: %s", e, exc_info=True)
         return {"status": f"error: {e}"}
 
 
@@ -117,7 +117,7 @@ def _run_score() -> dict:
         run_scoring()
         return {"status": "ok"}
     except Exception as e:
-        log.error("Scoring failed: %s", e)
+        log.error("Scoring failed: %s", e, exc_info=True)
         return {"status": f"error: {e}"}
 
 
@@ -128,7 +128,7 @@ def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
         run_tailoring(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
-        log.error("Tailoring failed: %s", e)
+        log.error("Tailoring failed: %s", e, exc_info=True)
         return {"status": f"error: {e}"}
 
 
@@ -139,18 +139,27 @@ def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
         run_cover_letters(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
-        log.error("Cover letter generation failed: %s", e)
+        log.error("Cover letter generation failed: %s", e, exc_info=True)
         return {"status": f"error: {e}"}
 
 
 def _run_pdf() -> dict:
     """Stage: PDF conversion — convert tailored resumes and cover letters to PDF."""
     try:
-        from applypilot.scoring.pdf import batch_convert
-        batch_convert()
-        return {"status": "ok"}
+        from applypilot.scoring.pdf import batch_convert, scan_pending
+        pending = len(scan_pending())
+        if not pending:
+            return {"status": "ok", "converted": 0}
+        converted = batch_convert()
+        if converted < pending:
+            log.warning(
+                "PDF conversion incomplete: %d/%d succeeded. If Chromium is missing, "
+                "run: python -m playwright install chromium",
+                converted, pending,
+            )
+        return {"status": "ok", "converted": converted, "pending": pending}
     except Exception as e:
-        log.error("PDF conversion failed: %s", e)
+        log.error("PDF conversion failed: %s", e, exc_info=True)
         return {"status": f"error: {e}"}
 
 
@@ -235,10 +244,8 @@ _PENDING_SQL: dict[str, str] = {
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < 5"
     ),
-    "pdf": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND tailored_resume_path LIKE '%.txt'"
-    ),
+    # "pdf" has no SQL entry on purpose -- whether a PDF is still needed depends
+    # on what is on disk, not on any column. See _count_pending().
 }
 
 # How long to sleep between polling loops in streaming mode (seconds)
@@ -247,6 +254,13 @@ _STREAM_POLL_INTERVAL = 10
 
 def _count_pending(stage: str, min_score: int = 7) -> int:
     """Count pending work items for a stage."""
+    if stage == "pdf":
+        # Filesystem, not SQL: a SQL count can't see which PDFs already exist,
+        # so it never decreased -- which made the streaming pdf stage loop
+        # forever (the caller runs `while pending > 0: runner()`).
+        from applypilot.scoring.pdf import scan_pending
+        return len(scan_pending())
+
     sql = _PENDING_SQL.get(stage)
     if sql is None:
         return 0
@@ -305,7 +319,8 @@ def _run_stage_streaming(
                 runner(**kwargs)
                 passes += 1
             except Exception as e:
-                log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
+                # A failed pass must not kill the streaming worker thread
+                log.error("Stage '%s' error (pass %d): %s", stage, passes, e, exc_info=True)
                 passes += 1
         else:
             # No work right now
@@ -335,7 +350,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
         meta = STAGE_META[name]
         console.print(f"\n{'=' * 70}")
         console.print(f"  [bold]STAGE: {name}[/bold] — {meta['desc']}")
-        console.print(f"  Started: {datetime.now().strftime('%H:%M:%S')}")
+        # .astimezone() keeps this the user's local wall clock, not UTC
+        console.print(f"  Started: {datetime.now(UTC).astimezone().strftime('%H:%M:%S')}")
         console.print(f"{'=' * 70}")
 
         t0 = time.time()
@@ -385,7 +401,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     stop_event = threading.Event()
     pipeline_start = time.time()
 
-    console.print(f"\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
+    console.print("\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
     console.print(f"  Poll interval: {_STREAM_POLL_INTERVAL}s\n")
 
     # Mark stages NOT in `ordered` as done so downstream doesn't wait for them
@@ -493,7 +509,7 @@ def run_pipeline(
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")
-        console.print(f"\n  No changes made.")
+        console.print("\n  No changes made.")
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
     # Execute
@@ -528,7 +544,7 @@ def run_pipeline(
 
     # Final DB stats
     final = get_stats()
-    console.print(f"\n  [bold]DB Final State:[/bold]")
+    console.print("\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")

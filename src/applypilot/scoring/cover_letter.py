@@ -5,14 +5,13 @@ postings. All personal data (name, skills, achievements) comes from the user's
 profile at runtime. No hardcoded personal information.
 """
 
-import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
-from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.database import get_connection
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
@@ -219,7 +218,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     # Convert rows to dicts
     if jobs and not isinstance(jobs[0], dict):
         columns = jobs[0].keys()
-        jobs = [dict(zip(columns, row)) for row in jobs]
+        jobs = [dict(zip(columns, row, strict=True)) for row in jobs]
 
     COVER_LETTER_DIR.mkdir(parents=True, exist_ok=True)
     log.info(
@@ -227,12 +226,10 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         len(jobs), min_score,
     )
     t0 = time.time()
-    completed = 0
     results: list[dict] = []
     error_count = 0
 
-    for job in jobs:
-        completed += 1
+    for completed, job in enumerate(jobs, start=1):
         try:
             letter = generate_cover_letter(resume_text, job, profile,
                                           validation_mode=validation_mode)
@@ -245,13 +242,15 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
 
-            # Generate PDF (best-effort)
+            # Generate PDF (best-effort -- the .txt must survive a PDF failure).
+            # Logged at warning, not debug: a silent failure here left 19 cover
+            # letters without PDFs and nobody noticed.
             pdf_path = None
             try:
                 from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
+                pdf_path = str(convert_to_pdf(cl_path, kind="cover"))
             except Exception:
-                log.debug("PDF generation failed for %s", cl_path, exc_info=True)
+                log.warning("PDF generation failed for %s", cl_path, exc_info=True)
 
             result = {
                 "url": job["url"],
@@ -269,6 +268,8 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
                 completed, len(jobs), rate * 60, result["title"][:40],
             )
         except Exception as e:
+            # One job failing must not abort the remaining cover letters
+            log.warning("Cover letter failed for %s: %s", job.get("title", "?"), e, exc_info=True)
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
                 "path": None, "pdf_path": None, "error": str(e),
@@ -278,7 +279,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
     # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     saved = 0
     for r in results:
         if r.get("path"):

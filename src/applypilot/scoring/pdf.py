@@ -5,11 +5,32 @@ and exports to PDF using headless Chromium via Playwright.
 """
 
 import logging
+import re
+from html import escape
 from pathlib import Path
 
-from applypilot.config import TAILORED_DIR
+from applypilot.config import COVER_LETTER_DIR, TAILORED_DIR
 
 log = logging.getLogger(__name__)
+
+# Shared page setup, so a cover letter looks like it belongs with the resume.
+_PAGE_CSS = """
+@page {
+    size: letter;
+    margin: 0.35in 0.5in;
+}
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.35;
+    color: #1a1a1a;
+}
+"""
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -97,8 +118,8 @@ def parse_skills(text: str) -> list[tuple[str, str]]:
         List of (category_name, skills_string) tuples.
     """
     skills: list[tuple[str, str]] = []
-    for line in text.strip().split("\n"):
-        line = line.strip()
+    for raw_line in text.strip().split("\n"):
+        line = raw_line.strip()
         if ":" in line:
             cat, val = line.split(":", 1)
             skills.append((cat.strip(), val.strip()))
@@ -122,7 +143,7 @@ def parse_entries(text: str) -> list[dict]:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith("- ") or stripped.startswith("\u2022 "):
+        if stripped.startswith(("- ", "\u2022 ")):
             if current:
                 current["bullets"].append(stripped[2:].strip())
         elif current is None or (
@@ -159,13 +180,16 @@ def build_html(resume: dict) -> str:
     """
     sections = resume["sections"]
 
+    # Every parsed value is escaped at interpolation -- the surrounding markup
+    # is ours, but the text came from an LLM and may contain & or <.
+
     # Skills
     skills_html = ""
     if "TECHNICAL SKILLS" in sections:
         skills = parse_skills(sections["TECHNICAL SKILLS"])
         rows = ""
         for cat, val in skills:
-            rows += f'<div class="skill-row"><span class="skill-cat">{cat}:</span> {val}</div>\n'
+            rows += f'<div class="skill-row"><span class="skill-cat">{escape(cat)}:</span> {escape(val)}</div>\n'
         skills_html = f'<div class="section"><div class="section-title">Technical Skills</div>{rows}</div>'
 
     # Experience
@@ -174,9 +198,10 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["EXPERIENCE"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(f"<li>{escape(b)}</li>" for b in e["bullets"])
+            subtitle = f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>' if e["subtitle"] else ""
+            items += (f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
+                      f'{subtitle}<ul>{bullets}</ul></div>')
         exp_html = f'<div class="section"><div class="section-title">Experience</div>{items}</div>'
 
     # Projects
@@ -185,50 +210,39 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["PROJECTS"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(f"<li>{escape(b)}</li>" for b in e["bullets"])
+            subtitle = f'<div class="entry-subtitle">{escape(e["subtitle"])}</div>' if e["subtitle"] else ""
+            items += (f'<div class="entry"><div class="entry-title">{escape(e["title"])}</div>'
+                      f'{subtitle}<ul>{bullets}</ul></div>')
         proj_html = f'<div class="section"><div class="section-title">Projects</div>{items}</div>'
 
     # Education
     edu_html = ""
     if "EDUCATION" in sections:
-        edu_text = sections["EDUCATION"].strip()
+        edu_text = escape(sections["EDUCATION"].strip())
         edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
 
     # Summary
     summary_html = ""
     if "SUMMARY" in sections:
-        summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
+        summary_text = escape(sections["SUMMARY"].strip())
+        summary_html = (f'<div class="section"><div class="section-title">Summary</div>'
+                        f'<div class="summary">{summary_text}</div></div>')
 
     # Contact line parsing
     contact = resume["contact"]
-    contact_parts = [p.strip() for p in contact.split("|")] if contact else []
+    contact_parts = [escape(p.strip()) for p in contact.split("|")] if contact else []
     contact_html = " &nbsp;|&nbsp; ".join(contact_parts)
 
     # Location line (may be empty)
-    location_html = f'<div class="location">{resume["location"]}</div>' if resume["location"] else ""
+    location_html = f'<div class="location">{escape(resume["location"])}</div>' if resume["location"] else ""
 
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-@page {{
-    size: letter;
-    margin: 0.35in 0.5in;
-}}
-* {{
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}}
-body {{
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
-    font-size: 10pt;
-    line-height: 1.35;
-    color: #1a1a1a;
-}}
+{_PAGE_CSS}
 .header {{
     text-align: center;
     margin-bottom: 4px;
@@ -317,8 +331,8 @@ li {{
 </head>
 <body>
 <div class="header">
-    <div class="name">{resume['name']}</div>
-    <div class="title">{resume['title']}</div>
+    <div class="name">{escape(resume['name'])}</div>
+    <div class="title">{escape(resume['title'])}</div>
     {location_html}
     <div class="contact">{contact_html}</div>
 </div>
@@ -329,6 +343,138 @@ li {{
 {edu_html}
 </body>
 </html>"""
+
+
+# ── Cover Letter Parser + Template ───────────────────────────────────────
+
+def _is_salutation(block: str) -> bool:
+    """True if a block looks like 'Dear Hiring Manager,' rather than prose."""
+    if "\n" in block or len(block) > 80:
+        return False
+    lowered = block.lower()
+    return lowered.startswith(("dear ", "to ", "hello", "hi ")) or block.endswith(",")
+
+
+def _is_closing(block: str) -> bool:
+    """True if a block looks like a sign-off ('Sincerely,\\nTolu') or a bare name.
+
+    Sentence-ending punctuation rules a block out: "Happy to discuss further."
+    is a closing paragraph, not a signature.
+    """
+    lines = block.split("\n")
+    if len(lines) > 3 or len(block) > 120:
+        return False
+    return all(len(ln) <= 60 and not ln.rstrip().endswith((".", "!", "?", ":")) for ln in lines)
+
+
+def parse_cover_letter(text: str) -> dict:
+    """Split a cover letter into salutation, body paragraphs, and sign-off.
+
+    Cover letters have none of the structure parse_resume() expects -- no
+    SUMMARY line, no ALL-CAPS section headers -- so they need their own parser.
+    Feeding one to parse_resume() sweeps every paragraph into the contact
+    header and silently drops the signature.
+
+    Every non-empty block of the source is preserved in exactly one of the
+    returned fields; nothing is discarded.
+
+    Args:
+        text: Full cover letter text.
+
+    Returns:
+        {"salutation": str, "paragraphs": list[str], "closing": list[str]}
+    """
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
+
+    salutation = ""
+    if blocks and _is_salutation(blocks[0]):
+        salutation = blocks.pop(0)
+
+    # len(blocks) > 1 guard: a single-block letter is all body, never a signature
+    closing: list[str] = []
+    if len(blocks) > 1 and _is_closing(blocks[-1]):
+        closing = [ln.strip() for ln in blocks.pop().split("\n") if ln.strip()]
+
+    return {"salutation": salutation, "paragraphs": blocks, "closing": closing}
+
+
+def build_cover_letter_html(letter: dict) -> str:
+    """Build business-letter HTML from parse_cover_letter() output.
+
+    Args:
+        letter: Parsed dict from parse_cover_letter().
+
+    Returns:
+        Complete HTML string ready for PDF rendering.
+    """
+    salutation_html = (
+        f'<div class="cl-salutation">{escape(letter["salutation"])}</div>'
+        if letter["salutation"] else ""
+    )
+    # Interior newlines are soft-wrapped by the LLM, not meaningful breaks
+    paragraphs_html = "".join(
+        f'<p class="cl-para">{escape(" ".join(p.split()))}</p>'
+        for p in letter["paragraphs"]
+    )
+    closing_html = ""
+    if letter["closing"]:
+        lines = "".join(f'<div>{escape(ln)}</div>' for ln in letter["closing"])
+        closing_html = f'<div class="cl-closing">{lines}</div>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{_PAGE_CSS}
+body {{
+    font-size: 10.5pt;
+    line-height: 1.5;
+}}
+.cl-salutation {{
+    font-size: 11pt;
+    color: #1a3a5c;
+    font-weight: 600;
+    margin-bottom: 10px;
+}}
+.cl-para {{
+    margin-bottom: 10px;
+    text-align: justify;
+}}
+.cl-closing {{
+    margin-top: 16px;
+    font-size: 11pt;
+    color: #1a3a5c;
+}}
+</style>
+</head>
+<body>
+{salutation_html}
+{paragraphs_html}
+{closing_html}
+</body>
+</html>"""
+
+
+_RESUME_SECTIONS = frozenset({"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"})
+
+
+def detect_kind(text_path: Path | None, text: str) -> str:
+    """Classify a document as "resume" or "cover".
+
+    Resume evidence wins: rendering a cover letter with the resume template is
+    ugly, but rendering a resume with the letter template would drop every
+    section. So an ALL-CAPS resume header always forces "resume", whatever the
+    filename says.
+    """
+    if any(ln.strip().upper() in _RESUME_SECTIONS for ln in text.splitlines()):
+        return "resume"
+    if text_path is not None and Path(text_path).stem.endswith("_CL"):
+        return "cover"
+    first = next((ln.strip() for ln in text.strip().splitlines() if ln.strip()), "")
+    if _is_salutation(first):
+        return "cover"
+    return "resume"
 
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
@@ -358,23 +504,30 @@ def render_pdf(html: str, output_path: str) -> None:
 # ── Public API ───────────────────────────────────────────────────────────
 
 def convert_to_pdf(
-    text_path: Path, output_path: Path | None = None, html_only: bool = False
+    text_path: Path, output_path: Path | None = None, html_only: bool = False,
+    kind: str | None = None,
 ) -> Path:
-    """Convert a text resume/cover letter to PDF.
+    """Convert a text resume or cover letter to PDF.
 
     Args:
         text_path: Path to the .txt file to convert.
         output_path: Optional override for the output path. Defaults to same
             name with .pdf extension.
         html_only: If True, output HTML instead of PDF.
+        kind: "resume" or "cover". When None, inferred from the _CL.txt
+            filename suffix, defaulting to "resume".
 
     Returns:
         Path to the generated PDF (or HTML) file.
     """
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
-    resume = parse_resume(text)
-    html = build_html(resume)
+
+    if kind is None:
+        kind = detect_kind(text_path, text)
+
+    html = (build_cover_letter_html(parse_cover_letter(text)) if kind == "cover"
+            else build_html(parse_resume(text)))
 
     if html_only:
         out = output_path or text_path.with_suffix(".html")
@@ -390,38 +543,52 @@ def convert_to_pdf(
     return out
 
 
-def batch_convert(limit: int = 50) -> int:
-    """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
+def scan_pending(limit: int = 0) -> list[tuple[Path, str]]:
+    """Find generated .txt files that don't have a PDF yet.
 
-    Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
-    .pdf with the same stem already exists, and converts any that are missing.
+    Whether a PDF is pending is a filesystem question -- there is no pdf path
+    column in the database -- so both the converter and the pipeline's pending
+    count go through here.
 
     Args:
-        limit: Maximum number of files to convert.
+        limit: Maximum number of files to return; 0 means no limit.
+
+    Returns:
+        List of (path, kind) pairs, where kind is "resume" or "cover".
+    """
+    pending: list[tuple[Path, str]] = []
+    for directory, kind in ((TAILORED_DIR, "resume"), (COVER_LETTER_DIR, "cover")):
+        if not directory.exists():
+            log.warning("Directory does not exist: %s", directory)
+            continue
+        for f in sorted(directory.glob("*.txt")):
+            # _JOB.txt is the archived job description, not a document to render
+            if f.name.endswith("_JOB.txt"):
+                continue
+            if f.with_suffix(".pdf").exists():
+                continue
+            pending.append((f, kind))
+            if limit and len(pending) >= limit:
+                return pending
+    return pending
+
+
+def batch_convert(limit: int = 50) -> int:
+    """Convert tailored resumes and cover letters that don't have PDFs yet.
+
+    Scans TAILORED_DIR (excluding the _JOB.txt job-description copies) and
+    COVER_LETTER_DIR, checks whether a .pdf with the same stem already exists,
+    and converts any that are missing. Each directory is rendered with its own
+    template -- a cover letter run through the resume template loses its body
+    and signature.
+
+    Args:
+        limit: Maximum number of files to convert across both directories.
 
     Returns:
         Number of PDFs generated.
     """
-    if not TAILORED_DIR.exists():
-        log.warning("Tailored directory does not exist: %s", TAILORED_DIR)
-        return 0
-
-    txt_files = sorted(TAILORED_DIR.glob("*.txt"))
-    # Exclude _JOB.txt and _CL.txt files from resume conversion
-    # (they get their own conversion calls)
-    candidates = [
-        f for f in txt_files
-        if not f.name.endswith("_JOB.txt")
-    ]
-
-    # Filter to those without a corresponding PDF
-    to_convert: list[Path] = []
-    for f in candidates:
-        pdf_path = f.with_suffix(".pdf")
-        if not pdf_path.exists():
-            to_convert.append(f)
-        if len(to_convert) >= limit:
-            break
+    to_convert = scan_pending(limit=limit)
 
     if not to_convert:
         log.info("All text files already have PDFs.")
@@ -429,12 +596,12 @@ def batch_convert(limit: int = 50) -> int:
 
     log.info("Converting %d files to PDF...", len(to_convert))
     converted = 0
-    for f in to_convert:
+    for f, kind in to_convert:
         try:
-            convert_to_pdf(f)
+            convert_to_pdf(f, kind=kind)
             converted += 1
-        except Exception as e:
-            log.error("Failed to convert %s: %s", f.name, e)
+        except Exception:
+            log.exception("Failed to convert %s", f.name)
 
-    log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)
+    log.info("Done: %d/%d PDFs generated", converted, len(to_convert))
     return converted

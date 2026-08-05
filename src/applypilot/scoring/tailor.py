@@ -13,18 +13,15 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -109,6 +106,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 - Do NOT invent work, companies, degrees, or certifications
 - Do NOT change real numbers ({metrics_str})
 - Preserved companies: {companies_str} -- names stay as-is
+- Preserved projects: {projects_str} -- names stay as-is
 - Preserved school: {school}
 - Must fit 1 page.
 
@@ -197,8 +195,8 @@ def extract_json(raw: str) -> dict:
 
     # Markdown fences
     if "```" in raw:
-        for part in raw.split("```")[1::2]:
-            part = part.strip()
+        for raw_part in raw.split("```")[1::2]:
+            part = raw_part.strip()
             if part.startswith("json"):
                 part = part[4:].strip()
             try:
@@ -276,8 +274,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         lines.append(sanitize_text(entry.get("header", "")))
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+        lines.extend(f"- {sanitize_text(b)}" for b in entry.get("bullets", []))
         lines.append("")
 
     # Projects
@@ -286,8 +283,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         lines.append(sanitize_text(entry.get("header", "")))
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+        lines.extend(f"- {sanitize_text(b)}" for b in entry.get("bullets", []))
         lines.append("")
 
     # Education
@@ -437,10 +433,9 @@ def tailor_resume(
 
         if not judge["passed"]:
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
-            if attempt < max_retries:
-                # In normal mode, only retry on judge failure if there are retries left
-                if validation_mode != "lenient":
-                    continue
+            # In normal mode, only retry on judge failure if there are retries left
+            if attempt < max_retries and validation_mode != "lenient":
+                continue
             # Accept best attempt on last retry (all modes) or if lenient
             report["status"] = "approved_with_judge_warning"
             return tailored, report
@@ -480,12 +475,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
     t0 = time.time()
-    completed = 0
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
-    for job in jobs:
-        completed += 1
+    for completed, job in enumerate(jobs, start=1):
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
@@ -521,9 +514,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             if report["status"] in ("approved", "approved_with_judge_warning"):
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
+                    pdf_path = str(convert_to_pdf(txt_path, kind="resume"))
                 except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                    log.warning("PDF generation failed for %s", txt_path, exc_info=True)
 
             result = {
                 "url": job["url"],
@@ -539,7 +532,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "url": job["url"], "title": job["title"], "site": job["site"],
                 "status": "error", "attempts": 0, "path": None, "pdf_path": None,
             }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
+            # One job failing must not abort the remaining resumes
+            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e,
+                      exc_info=True)
 
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
@@ -556,7 +551,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         )
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
         if r["status"] in _success_statuses:
