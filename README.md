@@ -22,21 +22,23 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ## What It Does
 
-ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
-
-Three commands. That's it.
+ApplyPilot is a job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, and writes cover letters. From there you either **submit by hand** from a dashboard that hands you the job link and the generated PDFs, or let it **submit for you** via browser automation.
 
 ```bash
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
-applypilot init          # one-time setup: resume, profile, preferences, API keys
-applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
-applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot apply         # autonomous browser-driven submission
-applypilot apply -w 3    # parallel apply (3 Chrome instances)
-applypilot apply --dry-run  # fill forms without submitting
+applypilot init                      # one-time setup: resume, profile, preferences, API keys
+applypilot doctor                    # verify your setup — what's installed, what's missing
+
+applypilot run discover enrich score # find and score jobs
+applypilot dashboard                 # approve the good ones in your browser
+applypilot run tailor cover pdf      # generate resumes + cover letters for approved jobs
+applypilot dashboard                 # Ready to Apply: open each posting, grab the PDFs, apply
 ```
+
+Nothing is tailored until you approve it — the LLM stages only run on jobs you've said yes to, which keeps API usage on jobs you actually want.
+
+Prefer hands-free? Add `applypilot apply` at the end for autonomous browser submission (see [Auto-Apply](#auto-apply)).
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
 
@@ -44,15 +46,19 @@ applypilot apply --dry-run  # fill forms without submitting
 
 ## Two Paths
 
-### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
+Both paths are identical up to the point where documents are ready. They differ only in who submits the application.
 
-Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
-
-### Discovery + Tailoring Only
+### Assisted (no extra dependencies)
 **Requires:** Python 3.11+, Gemini API key (free)
 
-Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
+Discovers, scores, tailors, and writes cover letters. The **Ready to Apply** dashboard then gives you each approved job's posting link with its resume and cover letter as PDFs, plus a *Mark as Applied* button to track what you've sent. You do the form-filling; everything else is prepared.
+
+Nothing here needs Node, Chrome, or the Claude Code CLI, so there's no browser automation to hang.
+
+### Autonomous
+**Requires:** the above, plus Node.js 18+, Chrome, and the Claude Code CLI
+
+Claude Code drives a real browser to fill and submit the forms for you. Powerful, but it depends on a live browser session and real-world ATS forms — expect to babysit it more than the assisted path.
 
 ---
 
@@ -62,10 +68,12 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 |-------|-------------|
 | **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
-| **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **3. Score** | AI rates every job 1-10 based on your resume and preferences |
+| **→ Review** | **You approve or reject.** Nothing downstream runs until you do — this gate is what keeps LLM spend on jobs you actually want |
+| **4. Tailor** | AI rewrites your resume per approved job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **6. PDF** | Renders both to PDF — resumes and cover letters each get their own layout |
+| **7. Apply** | Either you, from the Ready to Apply dashboard, or Claude Code driving a browser |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -89,10 +97,15 @@ Each stage is independent. Run them all or pick what you need.
 | Component | Required For | Details |
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
-| Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
-| Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| Playwright Chromium | PDF generation | `python -m playwright install chromium` — one time |
+| Node.js 18+ | Auto-apply only | Needed for `npx` to run Playwright MCP server |
+| Chrome/Chromium | Auto-apply only | Auto-detected on most systems |
+| Claude Code CLI | Auto-apply only | Install from [claude.ai/code](https://claude.ai/code) |
+
+The bottom three are only needed for autonomous submission — the assisted path never launches them.
+
+Playwright's Chromium is what renders the PDFs. If it's missing or out of date, PDF generation fails while the `.txt` files are still written; `applypilot run pdf` picks them up again once it's installed.
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
 
@@ -135,13 +148,50 @@ Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrap
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
 
 ### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold reach the review queue.
+
+### Review — the approval gate
+Scored jobs wait here. **Tailoring will not run on a job you haven't approved**, so this step is required, not optional.
+
+Approve in the browser via `applypilot dashboard`, or from the terminal:
+
+```bash
+applypilot review --list                 # show what's pending
+applypilot review                        # interactive: approve/reject one by one
+applypilot review --approve URL
+applypilot review --reject URL --note "contract role"
+```
 
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
 
 ### Cover Letter
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
+
+### PDF
+Renders the generated `.txt` files to PDF next to their source. Resumes and cover letters use different templates — a cover letter gets a business-letter layout, not the resume's section grid.
+
+```bash
+applypilot run pdf     # converts anything still missing a PDF
+```
+
+### Apply Manually — the Ready to Apply dashboard
+
+```bash
+applypilot dashboard   # http://127.0.0.1:7410
+```
+
+Below the Review Queue, **Ready to Apply** lists every approved job whose documents are ready. Each card gives you:
+
+- the job title, linking straight to the application page
+- **Resume** and **Cover Letter** as PDF (or `txt` if the PDF hasn't been generated)
+- a **Mark as Applied** button
+
+Open the posting, upload the two PDFs, submit, then click *Mark as Applied* — the card drops off the list. Jobs the auto-apply worker failed on or left mid-run also surface here, badged with why, so nothing gets stranded.
+
+Marking writes `apply_status='applied'` with `agent_id='self'`, so it survives `--reset-failed` and the auto-apply worker won't pick the job up again. Misclicked? `applypilot apply --mark-failed URL` puts it back.
+
+> Use `applypilot dashboard`, not `--no-server`. The static snapshot still opens documents from disk, but *Mark as Applied* needs the local server and is disabled without it.
 
 ### Auto-Apply
 Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
@@ -163,21 +213,36 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 ```
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
+
 applypilot run [stages...]              # Run pipeline stages (or 'all')
+                                        # stages: discover enrich score tailor cover pdf
 applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
+
+applypilot review                       # Approve/reject pending jobs (interactive)
+applypilot review --list                # List jobs awaiting approval
+applypilot review --approve URL         # Approve one job
+applypilot review --reject URL --note "reason"
+
+applypilot dashboard                    # Review queue + Ready to Apply (localhost:7410)
+applypilot dashboard --port 8080        # Use a different port
+applypilot dashboard --no-server        # Static HTML snapshot (buttons disabled)
+applypilot status                       # Pipeline statistics
+
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
+applypilot apply --approved-only        # Only jobs approved via review
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
-applypilot status                       # Pipeline statistics
-applypilot dashboard                    # Open HTML results dashboard
+applypilot apply --mark-applied URL     # Record a job as applied
+applypilot apply --mark-failed URL      # Record a job as failed (undoes Mark as Applied)
+applypilot apply --reset-failed         # Reset failed jobs for retry
 ```
 
 ---
