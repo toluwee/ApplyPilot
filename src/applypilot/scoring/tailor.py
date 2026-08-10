@@ -11,13 +11,13 @@ to avoid apologetic spirals.
 
 import json
 import logging
-import re
 import time
 from datetime import UTC, datetime
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.naming import safe_doc_prefix
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     sanitize_text,
@@ -483,10 +483,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            prefix = safe_doc_prefix(job["site"], job["title"], job["url"])
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
