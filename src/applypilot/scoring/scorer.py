@@ -10,6 +10,7 @@ import re
 import time
 from datetime import UTC, datetime
 
+from applypilot import rubric
 from applypilot.config import RESUME_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -137,6 +138,32 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     if jobs and not isinstance(jobs[0], dict):
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row, strict=True)) for row in jobs]
+
+    # Rubric recheck: full_description is available now, so this catches
+    # disqualifiers (contract terms, an actual dollar figure, "hybrid") that
+    # discovery-time fields missed. Jobs that fail are dropped -- deterministic
+    # criteria shouldn't cost an LLM call, and shouldn't reach the scorer at all.
+    rubric_cfg = rubric.load_rubric_config()
+    rubric_rejections: list[list[str]] = []
+    remaining: list[dict] = []
+    for job in jobs:
+        rubric_result = rubric.evaluate_rubric(job, rubric_cfg)
+        if rubric_result["passed"]:
+            remaining.append(job)
+        else:
+            rubric_rejections.append(rubric_result["reasons"])
+            conn.execute("DELETE FROM jobs WHERE url = ?", (job["url"],))
+    if rubric_rejections:
+        conn.commit()
+        breakdown = rubric.summarize_rejections(rubric_rejections)
+        breakdown_str = ", ".join(f"{v} {k}" for k, v in breakdown.items() if v)
+        log.info("Rubric: %d jobs disqualified after enrichment (%s), %d proceeding to LLM scoring",
+                  len(rubric_rejections), breakdown_str, len(remaining))
+    jobs = remaining
+
+    if not jobs:
+        log.info("No jobs remaining after rubric screening.")
+        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
 
     log.info("Scoring %d jobs sequentially...", len(jobs))
     t0 = time.time()

@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 
 import yaml
 
-from applypilot import config
+from applypilot import config, rubric
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
 
@@ -36,35 +36,6 @@ def load_employers() -> dict:
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     return data.get("employers", {})
-
-
-# -- Location filtering from search config -----------------------------------
-
-def _load_location_filter(search_cfg: dict | None = None):
-    """Load location accept/reject lists from search config."""
-    if search_cfg is None:
-        search_cfg = config.load_search_config()
-
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
-
-
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    return any(a.lower() in loc for a in accept)
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -221,7 +192,7 @@ def search_employer(
         for j in postings:
             loc = j.get("locationsText", "")
             if (location_filter and accept_locs is not None and reject_locs is not None
-                    and not _location_ok(loc, accept_locs, reject_locs)):
+                    and not rubric.location_ok(loc, accept_locs, reject_locs)):
                 continue
 
             all_jobs.append({
@@ -263,6 +234,7 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
         job["job_req_id"] = info.get("jobReqId", "")
         job["time_type"] = info.get("timeType", "")
         job["remote_type"] = info.get("remoteType", "")
+        job["country_code"] = (info.get("jobRequisitionLocation") or {}).get("country", {}).get("alpha2Code", "")
 
     except Exception as e:
         # Error is recorded on the job row; the batch continues
@@ -299,11 +271,17 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
 
 # -- DB storage --------------------------------------------------------------
 
-def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
-    """Store corporate jobs in DB. Returns (new, existing)."""
+def store_results(
+    conn: sqlite3.Connection, jobs: list[dict], employers: dict, rubric_cfg: dict | None = None,
+) -> tuple[int, int, list[list[str]]]:
+    """Store corporate jobs in DB. Returns (new, existing, rubric_rejections)."""
+    if rubric_cfg is None:
+        rubric_cfg = rubric.load_rubric_config()
+
     now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
+    rubric_rejections: list[list[str]] = []
 
     for job in jobs:
         url = job.get("apply_url", "")
@@ -319,6 +297,22 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         full_description = description if len(description) > 200 else None
         detail_scraped_at = now if full_description else None
         detail_error = job.get("detail_error")
+
+        rubric_result = rubric.evaluate_rubric(
+            {
+                "title": job.get("title"),
+                "location": job.get("location"),
+                "description": full_description or short_desc,
+                "full_description": full_description,
+                "remote_type": job.get("remote_type"),
+                "job_type": job.get("time_type"),
+                "country_code": job.get("country_code"),
+            },
+            rubric_cfg,
+        )
+        if not rubric_result["passed"]:
+            rubric_rejections.append(rubric_result["reasons"])
+            continue
 
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
@@ -336,7 +330,7 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
             existing += 1
 
     conn.commit()
-    return new, existing
+    return new, existing, rubric_rejections
 
 
 def _process_one(
@@ -344,8 +338,7 @@ def _process_one(
     employers: dict,
     search_text: str,
     location_filter: bool,
-    accept_locs: list[str],
-    reject_locs: list[str],
+    rubric_cfg: dict,
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
@@ -354,8 +347,8 @@ def _process_one(
         jobs = search_employer(
             employer_key, emp, search_text,
             location_filter=location_filter,
-            accept_locs=accept_locs,
-            reject_locs=reject_locs,
+            accept_locs=rubric_cfg["location_accept"],
+            reject_locs=rubric_cfg["location_reject"],
         )
     except Exception as e:
         # One employer failing must not stop the rest of the crawl
@@ -374,8 +367,13 @@ def _process_one(
                   exc_info=True)
 
     conn = get_connection()
-    new, existing = store_results(conn, jobs, employers)
-    log.info("%s: %d new, %d already in DB", emp["name"], new, existing)
+    new, existing, rubric_rejections = store_results(conn, jobs, employers, rubric_cfg=rubric_cfg)
+    msg = f"{emp['name']}: {new} new, {existing} already in DB"
+    if rubric_rejections:
+        breakdown = rubric.summarize_rejections(rubric_rejections)
+        breakdown_str = ", ".join(f"{v} {k}" for k, v in breakdown.items() if v)
+        msg += f", {len(rubric_rejections)} filtered (rubric: {breakdown_str})"
+    log.info(msg)
 
     return {"employer": emp["name"], "query": search_text,
             "found": len(jobs), "new": new, "existing": existing}
@@ -389,8 +387,7 @@ def scrape_employers(
     employer_keys: list[str] | None = None,
     location_filter: bool = True,
     max_results: int = 0,
-    accept_locs: list[str] | None = None,
-    reject_locs: list[str] | None = None,
+    rubric_cfg: dict | None = None,
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -401,10 +398,8 @@ def scrape_employers(
     if employer_keys is None:
         employer_keys = list(employers.keys())
 
-    if accept_locs is None:
-        accept_locs = []
-    if reject_locs is None:
-        reject_locs = []
+    if rubric_cfg is None:
+        rubric_cfg = rubric.load_rubric_config()
 
     # Ensure DB schema
     init_db()
@@ -424,7 +419,7 @@ def scrape_employers(
             futures = {
                 pool.submit(
                     _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
+                    location_filter, rubric_cfg,
                 ): key
                 for key in valid_keys
             }
@@ -446,7 +441,7 @@ def scrape_employers(
         for completed, key in enumerate(valid_keys, start=1):
             result = _process_one(
                 key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
+                location_filter, rubric_cfg,
             )
             total_new += result["new"]
             total_existing += result["existing"]
@@ -491,7 +486,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
-    accept_locs, reject_locs = _load_location_filter(search_cfg)
+    rubric_cfg = rubric.load_rubric_config(search_cfg)
 
     # Default to tier 1-2 queries for workday scraping
     max_tier = search_cfg.get("workday_max_tier", 2)
@@ -523,8 +518,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
             search_text=query,
             employers=employers,
             location_filter=location_filter,
-            accept_locs=accept_locs,
-            reject_locs=reject_locs,
+            rubric_cfg=rubric_cfg,
             workers=workers,
         )
         grand_new += result["new"]

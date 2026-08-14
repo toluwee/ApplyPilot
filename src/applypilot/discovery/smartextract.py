@@ -26,7 +26,7 @@ import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from applypilot import config
+from applypilot import config, rubric
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_stats, init_db
 from applypilot.llm import get_client
@@ -43,29 +43,6 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         log.debug("Could not force UTF-8 on stdout/stderr", exc_info=True)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-
-
-# -- Location filtering -------------------------------------------------------
-
-def _load_location_filter(search_cfg: dict | None = None):
-    """Load location accept/reject lists from search config."""
-    if search_cfg is None:
-        search_cfg = config.load_search_config()
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
-
-
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    if any(r.lower() in loc for r in reject):
-        return False
-    return any(a.lower() in loc for a in accept)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -85,22 +62,27 @@ def _store_jobs_filtered(
     jobs: list[dict],
     site: str,
     strategy: str,
-    accept_locs: list[str],
-    reject_locs: list[str],
-) -> tuple[int, int]:
-    """Store jobs with location filtering. Returns (new, existing)."""
+    rubric_cfg: dict,
+) -> tuple[int, int, list[list[str]]]:
+    """Store jobs after rubric screening (remote/contract/hourly/seniority/salary).
+
+    Returns (new, existing, rubric_rejections).
+    """
     now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
-    filtered = 0
+    rubric_rejections: list[list[str]] = []
 
     for job in jobs:
         url = job.get("url")
         if not url:
             continue
-        if not _location_ok(job.get("location"), accept_locs, reject_locs):
-            filtered += 1
+
+        rubric_result = rubric.evaluate_rubric(job, rubric_cfg)
+        if not rubric_result["passed"]:
+            rubric_rejections.append(rubric_result["reasons"])
             continue
+
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
@@ -112,10 +94,12 @@ def _store_jobs_filtered(
         except sqlite3.IntegrityError:
             existing += 1
 
-    if filtered:
-        log.info("Filtered %d jobs (wrong location)", filtered)
+    if rubric_rejections:
+        breakdown = rubric.summarize_rejections(rubric_rejections)
+        breakdown_str = ", ".join(f"{v} {k}" for k, v in breakdown.items() if v)
+        log.info("Filtered %d jobs (rubric: %s)", len(rubric_rejections), breakdown_str)
     conn.commit()
-    return new, existing
+    return new, existing, rubric_rejections
 
 
 # -- Page intelligence collector ---------------------------------------------
@@ -1015,8 +999,7 @@ def build_scrape_targets(
 
 def _run_all(
     targets: list[dict],
-    accept_locs: list[str],
-    reject_locs: list[str],
+    rubric_cfg: dict,
     workers: int = 1,
 ) -> dict:
     """Run smart extract on all targets.
@@ -1037,9 +1020,8 @@ def _run_all(
         nonlocal total_new, total_existing
         jobs = r.get("jobs", [])
         if jobs:
-            new, existing = _store_jobs_filtered(conn, jobs, target["name"],
-                                                  r.get("strategy", "?"),
-                                                  accept_locs, reject_locs)
+            new, existing, _ = _store_jobs_filtered(conn, jobs, target["name"],
+                                                      r.get("strategy", "?"), rubric_cfg)
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
@@ -1103,7 +1085,7 @@ def run_smart_extract(
         Dict with stats: total_new, total_existing, passed, total.
     """
     search_cfg = config.load_search_config()
-    accept_locs, reject_locs = _load_location_filter(search_cfg)
+    rubric_cfg = rubric.load_rubric_config(search_cfg)
 
     targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
 
@@ -1116,4 +1098,4 @@ def run_smart_extract(
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
 
-    return _run_all(targets, accept_locs, reject_locs, workers=workers)
+    return _run_all(targets, rubric_cfg, workers=workers)
